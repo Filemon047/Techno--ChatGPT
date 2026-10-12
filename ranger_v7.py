@@ -75,31 +75,38 @@ except ImportError:
 # 1. SETTINGS — safe starting values for a modest local machine
 # ============================================================
 
+
 ROOT = Path(__file__).resolve().parent
 
-GENERAL_FILE = ROOT / "training.txt"
+TRAINING_DIR = ROOT / "training data"
+
+TINY_STORIES_FILE = TRAINING_DIR / "tiny_stories.txt"
+GENERAL_FILE = TRAINING_DIR / "ranger_general.txt"
+
 CONVERSATION_FILES = [
-    ROOT / "ranger_conversation_training.txt",
-    ROOT / "ranger_conversation_extra.txt",
+    TRAINING_DIR / "ranger_conversation_training.txt",
+    TRAINING_DIR / "ranger_conversation_extra.txt",
 ]
-EVAL_FILE = ROOT / "ranger_eval.txt"  # Reference prompts only; never trained on.
+
+EVAL_FILE = TRAINING_DIR / "ranger_eval.txt"
 
 TOKENIZER_FILE = ROOT / "ranger_v7_tokenizer.json"
 LATEST_CHECKPOINT = ROOT / "ranger_v7_latest.pt"
 BEST_CHECKPOINT = ROOT / "ranger_v7_best.pt"
 LOG_FILE = ROOT / "ranger_v7_training_log.csv"
 
+
 # Model
 VOCAB_TARGET = 2048
 BLOCK_SIZE = 256
 N_EMBD = 256
 N_HEAD = 8
-N_LAYER = 4
+N_LAYER = 6
 DROPOUT = 0.10
 
 # Training
-BATCH_SIZE = 12
-TRAINING_STEPS = 8000
+BATCH_SIZE = 4
+TRAINING_STEPS = 3000
 EVAL_INTERVAL = 250
 EVAL_BATCHES = 12
 SAVE_INTERVAL = 500
@@ -121,7 +128,7 @@ MAX_HISTORY_TURNS = 4
 
 # True only if you intentionally want to discard the current v7 run and
 # start a fresh experiment. v4 is never touched.
-FRESH_START = False
+FRESH_START = True
 
 SPECIAL_TOKENS = [
     "<|pad|>",
@@ -252,6 +259,13 @@ def parse_dialogue(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def normalize_prompt(text: str) -> str:
+    """Normalize a prompt for duplicate detection."""
+    text = text.casefold()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
+
+
 def remove_labeled_dialogue(text: str) -> str:
     """
     Remove explicitly labelled Human/User/You/Ranger/Assistant turns
@@ -353,6 +367,31 @@ def load_corpora() -> tuple[list[str], list[tuple[str, str]]]:
         for u, r in dialogue_pairs
         if u.strip() and r.strip()
     ))
+
+
+    # Hold evaluation questions out of all dialogue training examples.
+    if EVAL_FILE.exists():
+        eval_pairs = parse_dialogue(read_text(EVAL_FILE))
+        eval_prompts = {
+            normalize_prompt(user_text)
+            for user_text, _ in eval_pairs
+        }
+
+        before_filter = len(dialogue_pairs)
+        dialogue_pairs = [
+            (user_text, ranger_text)
+            for user_text, ranger_text in dialogue_pairs
+            if normalize_prompt(user_text) not in eval_prompts
+        ]
+
+        removed = before_filter - len(dialogue_pairs)
+        print(
+            f"Evaluation-question duplicates excluded: {removed:,}"
+        )
+
+
+
+
 
     if len(dialogue_pairs) < 10:
         raise SystemExit(
@@ -670,7 +709,7 @@ class Ranger(nn.Module):
                 SPECIAL_TOKENS.index("<|user|>"),
                 SPECIAL_TOKENS.index("<|ranger|>"),
                 SPECIAL_TOKENS.index("<|doc|>"),
-            ]02
+            ]
             next_logits[0, forbidden_ids] = float("-inf")
 
             # Give Ranger at least four tokens to begin its answer
