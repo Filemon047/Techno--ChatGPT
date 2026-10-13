@@ -41,6 +41,7 @@ import re
 import shutil
 import sys
 import time
+import numpy as np
 from pathlib import Path
 from typing import Iterable
 
@@ -94,6 +95,12 @@ TOKENIZER_FILE = ROOT / "ranger_v7_tokenizer.json"
 LATEST_CHECKPOINT = ROOT / "ranger_v7_latest.pt"
 BEST_CHECKPOINT = ROOT / "ranger_v7_best.pt"
 LOG_FILE = ROOT / "ranger_v7_training_log.csv"
+# Disk-backed token data for the full TinyStories corpus.
+GENERAL_TRAIN_TOKENS = ROOT / "ranger_v7_general_train_tokens.bin"
+GENERAL_VAL_TOKENS = ROOT / "ranger_v7_general_val_tokens.bin"
+
+# Read text in manageable chunks instead of loading the whole file.
+TINY_STORIES_CHUNK_CHARS = 1_000_000
 
 
 # Model
@@ -156,6 +163,56 @@ def read_text(path: Path) -> str:
     except FileNotFoundError:
         return ""
 
+
+def iter_tiny_story_chunks(
+    path: Path,
+    chunk_chars: int = TINY_STORIES_CHUNK_CHARS,
+):
+    """Yield the entire TinyStories file in manageable text chunks."""
+    if not path.is_file():
+        raise SystemExit(f"TinyStories file not found: {path}")
+
+    buffer = []
+    buffer_chars = 0
+    chunks_read = 0
+
+    print(f"\nReading the complete corpus: {path.name}")
+    print(f"Source file size: {path.stat().st_size:,} bytes")
+
+    with path.open("r", encoding="utf-8", errors="replace") as source:
+        for line in source:
+            buffer.append(line)
+            buffer_chars += len(line)
+
+            if buffer_chars >= chunk_chars:
+                text = "".join(buffer)
+                text = re.sub(
+                    r"<\|endoftext\|>",
+                    "\n\n",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                yield f"<|doc|>\n{text}\n<|end|>"
+
+                chunks_read += 1
+                if chunks_read % 100 == 0:
+                    print(f"  Read {chunks_read:,} TinyStories chunks...")
+
+                buffer.clear()
+                buffer_chars = 0
+
+    if buffer:
+        text = "".join(buffer)
+        text = re.sub(
+            r"<\|endoftext\|>",
+            "\n\n",
+            text,
+            flags=re.IGNORECASE,
+        )
+        yield f"<|doc|>\n{text}\n<|end|>"
+        chunks_read += 1
+
+    print(f"Finished reading TinyStories: {chunks_read:,} chunks.")
 
 
 def split_documents(text: str, max_chars: int = 2500) -> list[str]:
@@ -481,7 +538,14 @@ def train_or_load_tokenizer(training_texts: list[str]) -> Tokenizer:
         initial_alphabet=ByteLevel.alphabet(),
         show_progress=True,
     )
-    tokenizer.train_from_iterator(iter(training_texts), trainer=trainer)
+    def all_tokenizer_text():
+        # Existing general text and conversation training examples.
+        yield from training_texts
+
+        # Every chunk of the complete TinyStories corpus.
+        yield from iter_tiny_story_chunks(TINY_STORIES_FILE)
+
+    tokenizer.train_from_iterator(all_tokenizer_text(), trainer=trainer)
     tokenizer.save(str(TOKENIZER_FILE))
     print(f"Tokenizer saved: {TOKENIZER_FILE.name}")
     print(f"Tokenizer vocabulary: {tokenizer.get_vocab_size():,} tokens")
@@ -493,6 +557,83 @@ def encode_texts(tokenizer: Tokenizer, texts: list[str]) -> torch.Tensor:
     for text in texts:
         ids.extend(tokenizer.encode(text).ids)
     return torch.tensor(ids, dtype=torch.long)
+
+
+def build_general_token_files(
+    tokenizer: Tokenizer,
+    general_train_texts: list[str],
+    general_val_texts: list[str],
+) -> tuple[np.memmap, np.memmap]:
+    """
+    Encode the existing general text and every TinyStories chunk.
+    Store token IDs on disk so the entire corpus need not fit in RAM.
+    TinyStories chunks are assigned to training or validation, never dropped.
+    """
+    rng = random.Random(RANDOM_SEED)
+
+    train_tokens_written = 0
+    val_tokens_written = 0
+    tiny_train_tokens = 0
+    tiny_val_tokens = 0
+
+    with (
+        GENERAL_TRAIN_TOKENS.open("wb") as train_file,
+        GENERAL_VAL_TOKENS.open("wb") as val_file,
+    ):
+        # Preserve the existing general-text training and validation data.
+        for text in general_train_texts:
+            ids = tokenizer.encode(text).ids
+            if ids:
+                np.asarray(ids, dtype=np.int32).tofile(train_file)
+                train_tokens_written += len(ids)
+
+        for text in general_val_texts:
+            ids = tokenizer.encode(text).ids
+            if ids:
+                np.asarray(ids, dtype=np.int32).tofile(val_file)
+                val_tokens_written += len(ids)
+
+        # Read and encode the complete TinyStories source, chunk by chunk.
+        chunks_seen = 0
+        for chunk in iter_tiny_story_chunks(TINY_STORIES_FILE):
+            ids = tokenizer.encode(chunk).ids
+            if not ids:
+                continue
+
+            # Hold out whole chunks for validation. Every chunk is retained.
+            if rng.random() < VALIDATION_FRACTION:
+                np.asarray(ids, dtype=np.int32).tofile(val_file)
+                val_tokens_written += len(ids)
+                tiny_val_tokens += len(ids)
+            else:
+                np.asarray(ids, dtype=np.int32).tofile(train_file)
+                train_tokens_written += len(ids)
+                tiny_train_tokens += len(ids)
+
+            chunks_seen += 1
+
+    if train_tokens_written <= BLOCK_SIZE + 1:
+        raise SystemExit("Too few general training tokens were written.")
+    if val_tokens_written <= BLOCK_SIZE + 1:
+        raise SystemExit("Too few general validation tokens were written.")
+
+    print("\nFull-corpus tokenization complete.")
+    print(f"TinyStories chunks encoded: {chunks_seen:,}")
+    print(f"TinyStories training tokens: {tiny_train_tokens:,}")
+    print(f"TinyStories validation tokens: {tiny_val_tokens:,}")
+    print(f"All general training tokens: {train_tokens_written:,}")
+    print(f"All general validation tokens: {val_tokens_written:,}")
+    print(f"Training token file: {GENERAL_TRAIN_TOKENS.name}")
+    print(f"Validation token file: {GENERAL_VAL_TOKENS.name}")
+
+    # Map the files from disk; do not copy the whole corpus into RAM.
+    train_data = np.memmap(
+        GENERAL_TRAIN_TOKENS, dtype=np.int32, mode="r"
+    )
+    val_data = np.memmap(
+        GENERAL_VAL_TOKENS, dtype=np.int32, mode="r"
+    )
+    return train_data, val_data
 
 
 def encode_dialogue_examples(
@@ -758,31 +899,50 @@ class Ranger(nn.Module):
 # ============================================================
 
 
+
 def get_batch(
-    data: torch.Tensor,
+    data,
     batch_size: int,
     generator=None,
 ):
-    if data.numel() <= BLOCK_SIZE + 1:
+    """Read only the requested training windows from memory or disk."""
+    data_length = len(data)
+
+    if data_length <= BLOCK_SIZE + 1:
         raise ValueError(
-            f"Encoded dataset has only {data.numel()} tokens; "
+            f"Encoded dataset has only {data_length} tokens; "
             f"need more than {BLOCK_SIZE + 1}."
         )
 
-    # The upper bound is exclusive. This includes every valid starting
-    # position while ensuring the final target stays inside the data.
     starts = torch.randint(
         0,
-        data.numel() - BLOCK_SIZE,
+        data_length - BLOCK_SIZE,
         (batch_size,),
         generator=generator,
-    )
+    ).tolist()
 
-    x = torch.stack([data[s:s + BLOCK_SIZE] for s in starts])
-    y = torch.stack([data[s + 1:s + BLOCK_SIZE + 1] for s in starts])
+    # Copy only the selected windows into small tensors.
+    x = torch.stack([
+        torch.from_numpy(
+            np.asarray(
+                data[start:start + BLOCK_SIZE],
+                dtype=np.int64,
+            ).copy()
+        )
+        for start in starts
+    ])
+
+    y = torch.stack([
+        torch.from_numpy(
+            np.asarray(
+                data[start + 1:start + BLOCK_SIZE + 1],
+                dtype=np.int64,
+            ).copy()
+        )
+        for start in starts
+    ])
 
     return x.to(DEVICE), y.to(DEVICE)
-
 
 
 
@@ -901,22 +1061,24 @@ def load_checkpoint(path: Path, model: Ranger, optimizer=None):
     return checkpoint
 
 
-def train_model(tokenizer: Tokenizer,
-                general_train_texts: list[str],
-                general_val_texts: list[str],
-                dialogue_train_texts: list[str],
-                dialogue_val_texts: list[str]) -> Ranger:
-    print("\nEncoding training and validation data...")
+    print("\nPreparing full general-text dataset...")
 
-    general_train = encode_texts(tokenizer, general_train_texts)
-    general_val = encode_texts(tokenizer, general_val_texts)
+    general_train, general_val = build_general_token_files(
+        tokenizer,
+        general_train_texts,
+        general_val_texts,
+    )
 
-    dialogue_train = encode_dialogue_examples(tokenizer, dialogue_train_texts)
-    dialogue_val = encode_dialogue_examples(tokenizer, dialogue_val_texts)
+    dialogue_train = encode_dialogue_examples(
+        tokenizer, dialogue_train_texts
+    )
+    dialogue_val = encode_dialogue_examples(
+        tokenizer, dialogue_val_texts
+    )
 
     # ADD THE PRINT BLOCK HERE
-    print(f"General training tokens: {general_train.numel():,}")
-    print(f"General validation tokens: {general_val.numel():,}")
+    print(f"General training tokens: {len(general_train):,}")
+    print(f"General validation tokens: {len(general_val):,}")
     print(
         "Dialogue training tokens: "
         f"{sum(len(ids) for ids, _ in dialogue_train):,}"
@@ -1046,6 +1208,29 @@ def train_model(tokenizer: Tokenizer,
                 best_validation, vocab_size, last_metrics
             )
             print(f"  Recovery checkpoint saved: {LATEST_CHECKPOINT.name}")
+
+        
+        if (
+            current_step >= EARLY_STOPPING_MIN_STEP
+            and bad_validation_checks >= EARLY_STOPPING_PATIENCE
+        ):
+            # Save a recovery checkpoint at the stopping point.
+            save_checkpoint(
+                LATEST_CHECKPOINT,
+                model,
+                optimizer,
+                current_step,
+                best_validation,
+                vocab_size,
+                last_metrics,
+            )
+            print(
+                f"\nEarly stopping at step {current_step:,}: "
+                f"validation did not improve meaningfully for "
+                f"{bad_validation_checks} checks."
+            )
+            break
+
 
     if BEST_CHECKPOINT.exists():
         try:
