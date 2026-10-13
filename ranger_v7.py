@@ -385,10 +385,26 @@ def parse_embedded_dialogue(text: str) -> list[tuple[str, str]]:
 
 
 def load_corpora() -> tuple[list[str], list[tuple[str, str]]]:
+
+        # TinyStories is streamed later; do not load the 1.92 GB file into RAM.
+    if not TINY_STORIES_FILE.is_file():
+        raise SystemExit(
+            f"\nTinyStories file not found: {TINY_STORIES_FILE}\n"
+            "Check the training data folder and filename."
+        )
+
+    tiny_size = TINY_STORIES_FILE.stat().st_size
+    if tiny_size == 0:
+        raise SystemExit(f"TinyStories file is empty: {TINY_STORIES_FILE}")
+
+    print(f"TinyStories source: {TINY_STORIES_FILE}")
+    print(f"TinyStories source size: {tiny_size:,} bytes")
+    print("TinyStories will be streamed in full; no sample will be used.")
+    
     if not GENERAL_FILE.exists():
         raise SystemExit(
             f"\nCould not find {GENERAL_FILE.name} in:\n{ROOT}\n"
-            "Keep ranger_v7.py beside training.txt."
+            "Check that ranger_v7.py and the training data folder are in place."
         )
 
     # Extract dialogue embedded in training.txt before splitting the
@@ -559,81 +575,79 @@ def encode_texts(tokenizer: Tokenizer, texts: list[str]) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 
+
 def build_general_token_files(
     tokenizer: Tokenizer,
     general_train_texts: list[str],
     general_val_texts: list[str],
-) -> tuple[np.memmap, np.memmap]:
-    """
-    Encode the existing general text and every TinyStories chunk.
-    Store token IDs on disk so the entire corpus need not fit in RAM.
-    TinyStories chunks are assigned to training or validation, never dropped.
-    """
-    rng = random.Random(RANDOM_SEED)
+):
+    """Encode general text and all TinyStories to disk-backed token files."""
+    train_count = 0
+    val_count = 0
+    tiny_train_count = 0
+    tiny_val_count = 0
+    chunks_seen = 0
+    split_rng = random.Random(RANDOM_SEED)
 
-    train_tokens_written = 0
-    val_tokens_written = 0
-    tiny_train_tokens = 0
-    tiny_val_tokens = 0
-
+    # 'wb' recreates these generated files for each fresh data build.
     with (
         GENERAL_TRAIN_TOKENS.open("wb") as train_file,
         GENERAL_VAL_TOKENS.open("wb") as val_file,
     ):
-        # Preserve the existing general-text training and validation data.
+        # Preserve the existing general-text train/validation split.
         for text in general_train_texts:
             ids = tokenizer.encode(text).ids
             if ids:
-                np.asarray(ids, dtype=np.int32).tofile(train_file)
-                train_tokens_written += len(ids)
+                np.asarray(ids, dtype=np.uint16).tofile(train_file)
+                train_count += len(ids)
 
         for text in general_val_texts:
             ids = tokenizer.encode(text).ids
             if ids:
-                np.asarray(ids, dtype=np.int32).tofile(val_file)
-                val_tokens_written += len(ids)
+                np.asarray(ids, dtype=np.uint16).tofile(val_file)
+                val_count += len(ids)
 
-        # Read and encode the complete TinyStories source, chunk by chunk.
-        chunks_seen = 0
-        for chunk in iter_tiny_story_chunks(TINY_STORIES_FILE):
-            ids = tokenizer.encode(chunk).ids
+        # Encode the entire TinyStories file, one chunk at a time.
+        for text in iter_tiny_stories_text(TINY_STORIES_FILE):
+            ids = tokenizer.encode(text).ids
             if not ids:
                 continue
 
-            # Hold out whole chunks for validation. Every chunk is retained.
-            if rng.random() < VALIDATION_FRACTION:
-                np.asarray(ids, dtype=np.int32).tofile(val_file)
-                val_tokens_written += len(ids)
-                tiny_val_tokens += len(ids)
+            # Every chunk goes to training OR validation.
+            if split_rng.random() < VALIDATION_FRACTION:
+                np.asarray(ids, dtype=np.uint16).tofile(val_file)
+                val_count += len(ids)
+                tiny_val_count += len(ids)
             else:
-                np.asarray(ids, dtype=np.int32).tofile(train_file)
-                train_tokens_written += len(ids)
-                tiny_train_tokens += len(ids)
+                np.asarray(ids, dtype=np.uint16).tofile(train_file)
+                train_count += len(ids)
+                tiny_train_count += len(ids)
 
             chunks_seen += 1
 
-    if train_tokens_written <= BLOCK_SIZE + 1:
+    if train_count <= BLOCK_SIZE + 1:
         raise SystemExit("Too few general training tokens were written.")
-    if val_tokens_written <= BLOCK_SIZE + 1:
+    if val_count <= BLOCK_SIZE + 1:
         raise SystemExit("Too few general validation tokens were written.")
 
-    print("\nFull-corpus tokenization complete.")
+    print("\nFull-corpus tokenization finished.")
     print(f"TinyStories chunks encoded: {chunks_seen:,}")
-    print(f"TinyStories training tokens: {tiny_train_tokens:,}")
-    print(f"TinyStories validation tokens: {tiny_val_tokens:,}")
-    print(f"All general training tokens: {train_tokens_written:,}")
-    print(f"All general validation tokens: {val_tokens_written:,}")
-    print(f"Training token file: {GENERAL_TRAIN_TOKENS.name}")
-    print(f"Validation token file: {GENERAL_VAL_TOKENS.name}")
+    print(f"TinyStories training tokens: {tiny_train_count:,}")
+    print(f"TinyStories validation tokens: {tiny_val_count:,}")
+    print(f"All general training tokens: {train_count:,}")
+    print(f"All general validation tokens: {val_count:,}")
+    print(f"Training tokens on disk: {GENERAL_TRAIN_TOKENS.name}")
+    print(f"Validation tokens on disk: {GENERAL_VAL_TOKENS.name}")
 
-    # Map the files from disk; do not copy the whole corpus into RAM.
+    # Map the token files from disk instead of loading them into RAM.
     train_data = np.memmap(
-        GENERAL_TRAIN_TOKENS, dtype=np.int32, mode="r"
+        GENERAL_TRAIN_TOKENS, dtype=np.uint16, mode="r"
     )
     val_data = np.memmap(
-        GENERAL_VAL_TOKENS, dtype=np.int32, mode="r"
+        GENERAL_VAL_TOKENS, dtype=np.uint16, mode="r"
     )
     return train_data, val_data
+
 
 
 def encode_dialogue_examples(
@@ -900,17 +914,18 @@ class Ranger(nn.Module):
 
 
 
+
 def get_batch(
     data,
     batch_size: int,
     generator=None,
 ):
-    """Read only the requested training windows from memory or disk."""
+    """Sample small training windows from a tensor or disk-backed array."""
     data_length = len(data)
 
     if data_length <= BLOCK_SIZE + 1:
         raise ValueError(
-            f"Encoded dataset has only {data_length} tokens; "
+            f"Encoded dataset has only {data_length:,} tokens; "
             f"need more than {BLOCK_SIZE + 1}."
         )
 
@@ -921,7 +936,7 @@ def get_batch(
         generator=generator,
     ).tolist()
 
-    # Copy only the selected windows into small tensors.
+    # Copy only the selected windows into normal CPU tensors.
     x = torch.stack([
         torch.from_numpy(
             np.asarray(
@@ -943,6 +958,7 @@ def get_batch(
     ])
 
     return x.to(DEVICE), y.to(DEVICE)
+
 
 
 
@@ -1061,7 +1077,7 @@ def load_checkpoint(path: Path, model: Ranger, optimizer=None):
     return checkpoint
 
 
-    print("\nPreparing full general-text dataset...")
+    print("\nBuilding disk-backed general-text token files...")
 
     general_train, general_val = build_general_token_files(
         tokenizer,
